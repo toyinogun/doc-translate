@@ -14,11 +14,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+import pandas as pd
 import pytesseract
 from PIL import Image, ImageEnhance
 from pdf2image import convert_from_path
 from google import genai
 from google.genai import types
+
+from pdf_builder import TranslatedPDFBuilder, TextBlock
 
 
 # Supported file extensions
@@ -424,6 +427,236 @@ def translate_text(text: str, model: str = DEFAULT_MODEL) -> str:
 
     print(f"  - Translation complete in {time.time() - translate_start:.1f}s")
     return "\n\n".join(translated_chunks)
+
+
+def extract_text_with_boxes(image: Image.Image) -> list[TextBlock]:
+    """
+    Extract text with bounding boxes from an image using Tesseract OCR.
+
+    Groups words by line and returns TextBlock objects with position info.
+
+    Args:
+        image: PIL Image object
+
+    Returns:
+        List of TextBlock objects with text and bounding box coordinates
+    """
+    # Get OCR data with bounding boxes
+    data = pytesseract.image_to_data(
+        image,
+        lang='nld',
+        config=TESSERACT_CONFIG,
+        output_type=pytesseract.Output.DATAFRAME
+    )
+
+    # Filter out rows with no text or low confidence
+    data = data[data['conf'] > 0]
+    data = data[data['text'].notna()]
+    data = data[data['text'].str.strip() != '']
+
+    if data.empty:
+        return []
+
+    # Group by block, paragraph, and line to reconstruct lines
+    text_blocks = []
+
+    # Group by block_num, par_num, line_num to get complete lines
+    grouped = data.groupby(['block_num', 'par_num', 'line_num'])
+
+    for (block_num, par_num, line_num), group in grouped:
+        if group.empty:
+            continue
+
+        # Combine words in the line
+        words = group.sort_values('word_num')
+        line_text = ' '.join(words['text'].astype(str).tolist())
+
+        if not line_text.strip():
+            continue
+
+        # Calculate bounding box for the entire line
+        left = int(words['left'].min())
+        top = int(words['top'].min())
+        right = int((words['left'] + words['width']).max())
+        bottom = int((words['top'] + words['height']).max())
+
+        width = right - left
+        height = bottom - top
+
+        # Average confidence for the line
+        avg_conf = words['conf'].mean()
+
+        text_blocks.append(TextBlock(
+            text=line_text,
+            translated_text="",  # Will be filled by translate_blocks
+            left=left,
+            top=top,
+            width=width,
+            height=height,
+            confidence=avg_conf
+        ))
+
+    return text_blocks
+
+
+def translate_blocks(
+    blocks: list[TextBlock],
+    model: str = DEFAULT_MODEL
+) -> list[TextBlock]:
+    """
+    Translate text blocks in batch.
+
+    Args:
+        blocks: List of TextBlock objects with original text
+        model: Gemini model to use for translation
+
+    Returns:
+        List of TextBlock objects with translated_text filled in
+    """
+    if not blocks:
+        return blocks
+
+    # Collect all text to translate
+    texts_to_translate = [b.text for b in blocks if b.text.strip()]
+
+    if not texts_to_translate:
+        return blocks
+
+    # Create batch translation prompt
+    # Number each line for easy parsing
+    numbered_text = "\n".join(
+        f"[{i}] {text}" for i, text in enumerate(texts_to_translate)
+    )
+
+    client = get_gemini_client()
+
+    config = types.GenerateContentConfig(
+        system_instruction=(
+            "You are a professional Dutch to English translator. "
+            "Translate each numbered line from Dutch to English. "
+            "Keep the same numbering format [N] for each line. "
+            "Preserve the meaning and be concise. "
+            "Output only the translations with their numbers, no commentary."
+        ),
+        temperature=0.3,
+    )
+
+    # Translate in chunks if needed
+    max_chars = 4000
+    chunks = []
+    current_chunk = []
+    current_len = 0
+
+    lines = numbered_text.split('\n')
+    for line in lines:
+        if current_len + len(line) + 1 > max_chars and current_chunk:
+            chunks.append('\n'.join(current_chunk))
+            current_chunk = []
+            current_len = 0
+        current_chunk.append(line)
+        current_len += len(line) + 1
+
+    if current_chunk:
+        chunks.append('\n'.join(current_chunk))
+
+    # Translate all chunks
+    all_translations = []
+    for chunk in chunks:
+        translated = translate_with_retry(client, model, chunk, config)
+        all_translations.append(translated)
+
+    # Parse translations back
+    full_translation = '\n'.join(all_translations)
+
+    # Create mapping from index to translation
+    translation_map = {}
+    for line in full_translation.split('\n'):
+        line = line.strip()
+        if line.startswith('[') and ']' in line:
+            try:
+                idx_end = line.index(']')
+                idx = int(line[1:idx_end])
+                translation = line[idx_end + 1:].strip()
+                translation_map[idx] = translation
+            except (ValueError, IndexError):
+                continue
+
+    # Map translations back to blocks
+    text_idx = 0
+    for block in blocks:
+        if block.text.strip():
+            block.translated_text = translation_map.get(text_idx, block.text)
+            text_idx += 1
+
+    return blocks
+
+
+def process_pdf_with_layout(
+    file_path: Path,
+    model: str = DEFAULT_MODEL,
+    progress_callback=None
+) -> Path:
+    """
+    Process a PDF file preserving layout with translated text overlay.
+
+    Args:
+        file_path: Path to the PDF file
+        model: Gemini model to use for translation
+        progress_callback: Optional callback(progress, message) for progress updates
+
+    Returns:
+        Path to the translated PDF file
+    """
+    def update_progress(progress: float, message: str):
+        if progress_callback:
+            progress_callback(progress, message)
+        print(f"  {message}")
+
+    update_progress(0.05, "Converting PDF to images...")
+
+    # Convert PDF to color images (for background preservation)
+    try:
+        images = convert_from_path(
+            str(file_path),
+            dpi=200,
+            thread_count=4
+        )
+    except Exception as e:
+        raise RuntimeError(f"Failed to convert PDF to images: {e}")
+
+    total_pages = len(images)
+    update_progress(0.1, f"Found {total_pages} page(s)")
+
+    # Create the output PDF
+    output_path = file_path.parent / f"{file_path.stem}_translated.pdf"
+
+    with TranslatedPDFBuilder() as builder:
+        for page_num, image in enumerate(images, start=1):
+            page_progress = 0.1 + (0.85 * (page_num - 1) / total_pages)
+            update_progress(page_progress, f"Processing page {page_num}/{total_pages}...")
+
+            # Extract text with bounding boxes
+            update_progress(page_progress + 0.02, f"  Extracting text from page {page_num}...")
+            text_blocks = extract_text_with_boxes(image)
+
+            if text_blocks:
+                # Translate all blocks for this page
+                update_progress(
+                    page_progress + 0.04,
+                    f"  Translating {len(text_blocks)} text blocks..."
+                )
+                text_blocks = translate_blocks(text_blocks, model)
+
+            # Add page with translated text (clean white background)
+            update_progress(page_progress + 0.06, f"  Building page {page_num}...")
+            builder.add_page_with_translation(image, text_blocks, dpi=200, use_background=False)
+
+        # Save the final PDF
+        update_progress(0.95, "Saving translated PDF...")
+        builder.save(output_path)
+
+    update_progress(1.0, f"Complete! Saved to {output_path.name}")
+    return output_path
 
 
 def save_output(

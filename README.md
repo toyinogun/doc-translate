@@ -142,6 +142,24 @@ export GEMINI_API_KEY="your-key-here"
 python main.py /path/to/your/document.pdf
 ```
 
+### Web Interface (Recommended for Non-Technical Users)
+
+DocuTranslate includes a simple web UI for drag-and-drop document translation:
+
+```bash
+# Set your API key
+export GEMINI_API_KEY="your-key-here"
+
+# Start the web interface
+python app.py
+```
+
+This opens a browser at `http://localhost:7860` where you can:
+- Drag and drop files to upload
+- Select the translation model
+- View original and translated text side by side
+- Download the translation
+
 ### Model Selection
 
 You can choose different Gemini models based on your needs:
