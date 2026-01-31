@@ -1,0 +1,22 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount local documents folder for input/output
+      - ./documents:/documents
+    environment:
+      # Gemini API key (required)
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      # Set Tesseract data path (default location in Debian/Ubuntu)
+      - TESSDATA_PREFIX=/usr/share/tesseract-ocr/5/tessdata
+    # Working directory inside container
+    working_dir: /app
+
+# Usage:
+# 1. Set your API key: export GEMINI_API_KEY="your-key-here"
+# 2. Create a 'documents' folder in the same directory as this file
+# 3. Place your PDF files in the 'documents' folder
+# 4. Run: docker-compose run --rm app /documents/myfile.pdf
+# 5. Translated output will be saved in the 'documents' folder
